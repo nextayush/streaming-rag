@@ -1,0 +1,10 @@
+qdrant-client
+confluent-kafka
+langgraph
+langchain
+langchain-community
+langchain-ollama
+sentence-transformers
+python-dotenv
+requests
+pandas
