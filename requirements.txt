@@ -8,3 +8,9 @@ sentence-transformers
 python-dotenv
 requests
 pandas
+yfinance
+psutil
+fastapi
+uvicorn
+flashrank
+websockets

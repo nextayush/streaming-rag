@@ -1,5 +1,8 @@
 import os
 import requests
+import time
+import math
+import yfinance as yf
 from typing import List, Dict
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
@@ -9,52 +12,94 @@ load_dotenv()
 
 # Configuration
 QDRANT_HOST = os.getenv('QDRANT_HOST', '127.0.0.1')
-QDRANT_PORT = int(os.getenv('QDRANT_PORT', 6333))
+QDRANT_PORT = 6333
 COLLECTION_NAME = os.getenv('QDRANT_COLLECTION', 'real_time_knowledge')
 OLLAMA_URL = os.getenv('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3:8b')
-EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL_NAME', 'all-MiniLM-L6-v2')
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3.2')
 
-# Initialize Clients
+# Initialize
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, check_compatibility=False)
-embedder = SentenceTransformer(EMBEDDING_MODEL)
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
-def get_relevant_context(query: str, limit: int = 5) -> List[Dict]:
-    query_vector = embedder.encode(query).tolist()
-    
-    search_results = qdrant.query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vector,
-        limit=limit
-    ).points
-    
-    contexts = []
-    for res in search_results:
-        contexts.append({
-            "content": res.payload['content'],
-            "timestamp": res.payload['timestamp'],
-            "symbol": res.payload['symbol']
-        })
-    return contexts
+STOCK_MAP = {
+    'apple': 'AAPL', 'microsoft': 'MSFT', 'google': 'GOOGL', 'alphabet': 'GOOGL',
+    'amazon': 'AMZN', 'nvidia': 'NVDA', 'meta': 'META', 'facebook': 'META',
+    'tesla': 'TSLA', 'amd': 'AMD', 'intel': 'INTC', 'bitcoin': 'BTC-USD'
+}
 
-def query_ollama(query: str, context_docs: List[Dict]):
-    context_str = "\n".join([
-        f"- {doc['content']} (Recorded at: {doc['timestamp']})" 
-        for doc in context_docs
-    ])
+def fetch_historical_metrics(tickers: List[str]) -> str:
+    combined_history = ""
+    for symbol in tickers:
+        try:
+            t = yf.Ticker(symbol)
+            hist = t.history(period="1mo")
+            if hist.empty: continue
+            pct_change = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
+            high_price = hist['High'].max()
+            combined_history += f"- {symbol}: {pct_change:.2f}% Monthly Growth | 1-Month High: ${high_price:.2f}\n"
+        except Exception: pass
+    return combined_history
+
+def get_adaptive_context(query: str) -> str:
+    now = time.time()
+    detected_tickers = [ticker for name, ticker in STOCK_MAP.items() if name in query.lower()]
     
-    # Print retrieved context for debugging
-    print("\n--- RETRIEVED CONTEXT ---")
-    print(context_str)
-    print("-------------------------\n")
+    live_docs = []
+    search_queries = [query]
+    for ticker in detected_tickers:
+        search_queries.append(f"{ticker} price update")
+        search_queries.append(f"{ticker} news sentiment")
+
+    for sq in search_queries:
+        query_vector = embedder.encode(sq).tolist()
+        results = qdrant.query_points(collection_name=COLLECTION_NAME, query=query_vector, limit=5).points
+        for p in results:
+            payload = p.payload or {}
+            live_docs.append(f"[{payload.get('type')} | {payload.get('sentiment')}] {payload.get('content')}")
+
+    context_str = "--- LIVE STREAM & SENTIMENT DATA ---\n" + "\n".join(list(set(live_docs)))
     
-    prompt = f"""<|system|>
-You are a Real-Time Intelligence Assistant. Use the following pieces of retrieved real-time information to answer the user's question.
-If you don't know the answer based on the context, just say that you don't have real-time data on that yet. 
-Be concise and factual.
+    # Only fetch history for complex analysis
+    if 'month' in query.lower() or 'compare' in query.lower() or 'buy' in query.lower() or 'better' in query.lower():
+        history_str = fetch_historical_metrics(detected_tickers)
+        context_str += f"\n\n--- HISTORICAL ARCHIVE ---\n{history_str}"
+        
+    return context_str
+
+def query_adaptive_agent(query: str, context: str):
+    # Intent Detection: Factual vs. Analytical
+    factual_triggers = ['price', 'what is', 'how much', 'current value']
+    strategic_triggers = [
+        'buy', 'compare', 'better', 'should', 'analyze', 'trend', 
+        'direction', 'headed', 'outlook', 'movement', 'recommend', 'worth'
+    ]
+    
+    is_strategic = any(k in query.lower() for k in strategic_triggers)
+    
+    if not is_strategic:
+        # FLASH MODE: High-speed factual lookup
+        prompt = f"""<|system|>
+You are a High-Speed Market Data Terminal. Provide a CONCISE, ONE-LINE data response. 
+Include the current price and a brief momentum indicator (e.g., 'Trending Up').
 
 Context:
-{context_str}
+{context}
+<|user|>
+Question: {query}
+<|assistant|>
+Answer:"""
+    else:
+        # STRATEGIC MODE: Narrative-aware analysis
+        prompt = f"""<|system|>
+You are a Senior Market Intelligence Agent. Provide a structured Strategic Analysis.
+MANDATORY REPORT STRUCTURE:
+1. **EXECUTIVE SUMMARY**: Factual summary of the current trend/direction.
+2. **QUANTITATIVE MOMENTUM**: Analyze the direction of recent price updates.
+3. **SENTIMENT VALIDATION**: How news headlines support or contradict this direction.
+4. **RISK ASSESSMENT**: Potential traps or reversals.
+
+Context:
+{context}
 <|user|>
 Question: {query}
 <|assistant|>
@@ -62,45 +107,23 @@ Answer:"""
 
     response = requests.post(
         f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "num_ctx": 2048,
-                "temperature": 0.1
-            }
-        }
+        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"num_ctx": 4096, "temperature": 0}}
     )
-    
-    if response.status_code == 200:
-        return response.json()['response']
-    else:
-        return f"Error: {response.text}"
+    return response.json().get('response', 'Error')
 
-def run_rag_loop():
-    print(f"--- Real-Time RAG Interface (Model: {OLLAMA_MODEL}) ---")
-    print("Type 'exit' to quit.")
-    
+def main():
+    print(f"🚀 [ADAPTIVE INTELLIGENCE CORE] Intent-Aware Mode Active.")
     while True:
-        user_query = input("\nQuery: ")
-        if user_query.lower() in ['exit', 'quit']:
-            break
+        query = input("\nQuery Market Intelligence: ")
+        if query.lower() in ['exit', 'quit']: break
         
-        print("Searching real-time memory...")
-        context = get_relevant_context(user_query)
+        context = get_adaptive_context(query)
+        answer = query_adaptive_agent(query, context)
         
-        if not context:
-            print("No real-time context found for this query.")
-            continue
-            
-        print(f"Found {len(context)} relevant events. Thinking...")
-        answer = query_ollama(user_query, context)
-        
-        print("\nAI Response:")
-        print("-" * 50)
+        print(f"\n✨ Response:")
+        print("=" * 75 if len(answer) > 100 else "-" * 20)
         print(answer)
-        print("-" * 50)
+        print("=" * 75 if len(answer) > 100 else "-" * 20)
 
 if __name__ == "__main__":
-    run_rag_loop()
+    main()

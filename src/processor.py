@@ -1,87 +1,110 @@
 import json
 import os
 import uuid
-from typing import TypedDict, Annotated, List
+import time
+import requests
+from typing import TypedDict, List
 from dotenv import load_dotenv
 from confluent_kafka import Consumer, KafkaError
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from langgraph.graph import StateGraph, END
+from datetime import datetime
 
 load_dotenv()
 
 # Configuration
 KAFKA_CONF = {
     'bootstrap.servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092'),
-    'group.id': 'rag-processor-group',
-    'auto.offset.reset': 'earliest'
+    'group.id': 'rag-multimodal-processor',
+    'auto.offset.reset': 'latest'
 }
 TOPIC = os.getenv('KAFKA_TOPIC', 'live_stream')
 QDRANT_HOST = os.getenv('QDRANT_HOST', '127.0.0.1')
-QDRANT_PORT = int(os.getenv('QDRANT_PORT', 6333))
+QDRANT_PORT = 6333
 COLLECTION_NAME = os.getenv('QDRANT_COLLECTION', 'real_time_knowledge')
-MODEL_NAME = os.getenv('EMBEDDING_MODEL_NAME', 'all-MiniLM-L6-v2')
+DASHBOARD_URL = "http://127.0.0.1:8000/update_metrics"
 
-# Initialize Clients
-qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-embedder = SentenceTransformer(MODEL_NAME)
+# Initialize
+qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, check_compatibility=False)
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+analyzer = SentimentIntensityAnalyzer()
 
-# Ensure collection exists
-try:
-    qdrant.get_collection(COLLECTION_NAME)
-    print(f"Collection '{COLLECTION_NAME}' already exists.")
-except Exception:
-    print(f"Creating collection '{COLLECTION_NAME}'...")
-    qdrant.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=models.VectorParams(
-            size=384,  # size for all-MiniLM-L6-v2
-            distance=models.Distance.COSINE
-        )
-    )
-
-# LangGraph State
 class ProcessorState(TypedDict):
     raw_data: dict
+    semantic_data: dict
     embedding: List[float]
-    status: str
+    latencies: dict
+
+def analysis_node(state: ProcessorState):
+    data = state['raw_data']
+    sentiment_score = 0
+    sentiment_label = "NEUTRAL"
+    
+    if data['type'] == "NEWS_ARTICLE":
+        scores = analyzer.polarity_scores(data['content'])
+        sentiment_score = scores['compound']
+        if sentiment_score >= 0.05: sentiment_label = "POSITIVE"
+        elif sentiment_score <= -0.05: sentiment_label = "NEGATIVE"
+        
+    state['semantic_data'] = {
+        "content": data['content'],
+        "sentiment": sentiment_label,
+        "sentiment_score": sentiment_score,
+        "type": data['type'],
+        "weight": 1.5 if abs(sentiment_score) > 0.5 else 1.0
+    }
+    return state
 
 def embed_node(state: ProcessorState):
-    content = state['raw_data']['content']
-    print(f"Embedding: {content[:50]}...")
-    vector = embedder.encode(content).tolist()
-    return {"embedding": vector, "status": "embedded"}
+    start_time = time.time()
+    # Prepend sentiment to content for semantic search awareness
+    text_to_embed = f"[{state['semantic_data']['sentiment']}] {state['semantic_data']['content']}"
+    state['embedding'] = embedder.encode(text_to_embed).tolist()
+    state['latencies'] = {"embed_ms": (time.time() - start_time) * 1000}
+    return state
 
 def index_node(state: ProcessorState):
+    start_time = time.time()
     data = state['raw_data']
-    vector = state['embedding']
+    semantic = state['semantic_data']
     
-    point_id = str(uuid.uuid4())
     qdrant.upsert(
         collection_name=COLLECTION_NAME,
         points=[
             models.PointStruct(
-                id=point_id,
-                vector=vector,
+                id=str(uuid.uuid4()),
+                vector=state['embedding'],
                 payload={
-                    "content": data['content'],
-                    "timestamp": data['timestamp'],
-                    "source": data['source'],
-                    "symbol": data['symbol'],
-                    **data.get('metadata', {})
+                    **data,
+                    **semantic,
+                    "ingest_timestamp": time.time()
                 }
             )
         ]
     )
-    print(f"Indexed: {data['symbol']} at {data['timestamp']}")
-    return {"status": "indexed"}
+    
+    total_ms = (time.time() - data['producer_start_time']) * 1000
+    try:
+        requests.post(DASHBOARD_URL, json={
+            "symbol": data['symbol'],
+            "embed_ms": state['latencies']['embed_ms'],
+            "index_ms": (time.time() - start_time) * 1000,
+            "total_ms": total_ms,
+            "timestamp": datetime.now().strftime("%H:%M:%S")
+        }, timeout=0.1)
+    except: pass
+    return state
 
 # Build Graph
 workflow = StateGraph(ProcessorState)
+workflow.add_node("analyze", analysis_node)
 workflow.add_node("embed", embed_node)
 workflow.add_node("index", index_node)
-workflow.set_entry_point("embed")
+workflow.set_entry_point("analyze")
+workflow.add_edge("analyze", "embed")
 workflow.add_edge("embed", "index")
 workflow.add_edge("index", END)
 processor_app = workflow.compile()
@@ -89,32 +112,14 @@ processor_app = workflow.compile()
 def run_consumer():
     consumer = Consumer(KAFKA_CONF)
     consumer.subscribe([TOPIC])
-    
-    print(f"Starting consumer on topic: {TOPIC}")
-    try:
-        while True:
-            msg = consumer.poll(1.0)
-            if msg is None:
-                continue
-            if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    continue
-                else:
-                    print(msg.error())
-                    break
-            
-            # Process message
-            try:
-                raw_data = json.loads(msg.value().decode('utf-8'))
-                initial_state = {"raw_data": raw_data}
-                processor_app.invoke(initial_state)
-            except Exception as e:
-                print(f"Error processing message: {e}")
-                
-    except KeyboardInterrupt:
-        print("Stopping consumer...")
-    finally:
-        consumer.close()
+    print(f"🧠 Multi-Modal Sentiment Processor Online.")
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is None or msg.error(): continue
+        try:
+            raw_data = json.loads(msg.value().decode('utf-8'))
+            processor_app.invoke({"raw_data": raw_data})
+        except Exception as e: print(f"Error: {e}")
 
 if __name__ == "__main__":
     run_consumer()

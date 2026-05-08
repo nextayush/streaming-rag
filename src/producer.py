@@ -1,9 +1,10 @@
 import json
 import time
-import random
+import yfinance as yf
 from confluent_kafka import Producer
 from datetime import datetime
 import os
+import random
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,63 +12,108 @@ load_dotenv()
 # Kafka configuration
 conf = {
     'bootstrap.servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092'),
-    'client.id': 'stock-producer'
+    'client.id': 'advanced-aliasing-producer'
 }
 
 producer = Producer(conf)
 topic = os.getenv('KAFKA_TOPIC', 'live_stream')
 
+# Expanded Stock Universe with Human-Readable Names
+STOCK_MAP = {
+    'AAPL': 'Apple Inc.',
+    'MSFT': 'Microsoft Corporation',
+    'GOOGL': 'Alphabet Inc. (Google)',
+    'AMZN': 'Amazon.com Inc.',
+    'NVDA': 'NVIDIA Corporation',
+    'META': 'Meta Platforms (Facebook)',
+    'TSLA': 'Tesla Inc.',
+    'NFLX': 'Netflix Inc.',
+    'AMD': 'Advanced Micro Devices (AMD)',
+    'INTC': 'Intel Corporation',
+    'ADBE': 'Adobe Inc.',
+    'CRM': 'Salesforce Inc.',
+    'ORCL': 'Oracle Corporation',
+    'AVGO': 'Broadcom Inc.',
+    'QCOM': 'Qualcomm Inc.',
+    'BTC-USD': 'Bitcoin'
+}
+
 def delivery_report(err, msg):
     if err is not None:
         print(f'Message delivery failed: {err}')
-    else:
-        print(f'Message delivered to {msg.topic()} [{msg.partition()}]')
 
-def generate_mock_data():
-    stocks = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'TSLA', 'META', 'NVDA', 'NFLX']
-    events = [
-        "is launching a new AI-powered product today.",
-        "reported higher than expected quarterly earnings.",
-        "announced a strategic partnership with a major cloud provider.",
-        "is facing regulatory scrutiny over data privacy.",
-        "saw a sharp increase in stock price after the keynote.",
-        "is expanding its operations into the European market.",
-        "suffered a minor security breach, according to sources.",
-        "is investing heavily in quantum computing research."
-    ]
-    
-    symbol = random.choice(stocks)
-    event = random.choice(events)
-    price_change = round(random.uniform(-5.0, 5.0), 2)
-    
-    content = f"{symbol} {event} Stock price changed by {price_change}%."
-    
-    return {
-        "timestamp": datetime.now().isoformat(),
-        "source": "live_ticker",
-        "symbol": symbol,
-        "content": content,
-        "metadata": {
-            "price_change": price_change,
-            "priority": "high" if abs(price_change) > 3 else "normal"
-        }
-    }
+def fetch_enhanced_data(symbol, company_name):
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.fast_info
+        
+        current_price = info.last_price or 0
+        market_cap = info.market_cap or 0
+        cap_str = f"${market_cap/1e12:.2f}T" if market_cap > 0 else "N/A"
+        
+        messages = []
+        
+        # 1. Price Message with Explicit Company Name for Semantic Search
+        messages.append({
+            "type": "PRICE_UPDATE",
+            "timestamp": datetime.now().isoformat(),
+            "producer_start_time": time.time(),
+            "symbol": symbol,
+            "company_name": company_name,
+            "content": f"{company_name} ({symbol}) is currently trading at ${current_price:,.2f}. Market Cap: {cap_str}.",
+            "metadata": {"price": current_price, "source": "YahooFinance"}
+        })
+        
+        # 2. News Message with Explicit Company Name
+        news = ticker.news or []
+        for article in news[:2]:
+            title = article.get('title')
+            if not title: continue
+            
+            messages.append({
+                "type": "NEWS_ARTICLE",
+                "timestamp": datetime.now().isoformat(),
+                "producer_start_time": time.time(),
+                "symbol": symbol,
+                "company_name": company_name,
+                "content": f"LATEST NEWS for {company_name}: {title}",
+                "metadata": {
+                    "link": article.get('link', '#'),
+                    "publisher": article.get('publisher', 'Unknown'),
+                    "source": "YahooFinance-News"
+                }
+            })
+            
+        return messages
+    except Exception as e:
+        print(f"⚠️ Warning: {symbol} skip: {e}")
+        return []
 
-print(f"Starting producer, sending messages to topic: {topic}")
+print(f"🚀 Advanced Aliasing Producer Online.")
+print(f"Tracking {len(STOCK_MAP)} entities...")
 
 try:
     while True:
-        data = generate_mock_data()
-        producer.produce(
-            topic, 
-            key=data['symbol'], 
-            value=json.dumps(data).encode('utf-8'),
-            callback=delivery_report
-        )
-        producer.poll(0)
-        print(f"Sent: {data['content']}")
-        time.sleep(2)  # Send a new event every 2 seconds
+        symbols = list(STOCK_MAP.keys())
+        random.shuffle(symbols)
+        
+        for symbol in symbols:
+            company_name = STOCK_MAP[symbol]
+            msgs = fetch_enhanced_data(symbol, company_name)
+            for data in msgs:
+                producer.produce(
+                    topic, 
+                    key=symbol, 
+                    value=json.dumps(data).encode('utf-8'),
+                    callback=delivery_report
+                )
+                print(f"📡 {symbol} ({company_name}) Update sent.")
+            
+            producer.poll(0)
+            time.sleep(0.5)
+            
+        time.sleep(10)
 except KeyboardInterrupt:
-    print("Stopping producer...")
+    print("Stopping...")
 finally:
     producer.flush()
