@@ -10,14 +10,12 @@ from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
-# Configuration
 QDRANT_HOST = os.getenv('QDRANT_HOST', '127.0.0.1')
 QDRANT_PORT = 6333
 COLLECTION_NAME = os.getenv('QDRANT_COLLECTION', 'real_time_knowledge')
 OLLAMA_URL = os.getenv('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'llama3.2')
 
-# Initialize
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, check_compatibility=False)
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -50,16 +48,17 @@ def get_adaptive_context(query: str) -> str:
         search_queries.append(f"{ticker} price update")
         search_queries.append(f"{ticker} news sentiment")
 
-    for sq in search_queries:
-        query_vector = embedder.encode(sq).tolist()
-        results = qdrant.query_points(collection_name=COLLECTION_NAME, query=query_vector, limit=5).points
-        for p in results:
-            payload = p.payload or {}
-            live_docs.append(f"[{payload.get('type')} | {payload.get('sentiment')}] {payload.get('content')}")
-
-    context_str = "--- LIVE STREAM & SENTIMENT DATA ---\n" + "\n".join(list(set(live_docs)))
+    try:
+        for sq in search_queries:
+            query_vector = embedder.encode(sq).tolist()
+            results = qdrant.query_points(collection_name=COLLECTION_NAME, query=query_vector, limit=5).points
+            for p in results:
+                payload = p.payload or {}
+                live_docs.append(f"[{payload.get('type')} | {payload.get('sentiment')}] {payload.get('content')}")
+        context_str = "--- LIVE STREAM & SENTIMENT DATA ---\n" + "\n".join(list(set(live_docs)))
+    except Exception as e:
+        context_str = f"--- LIVE STREAM (OFFLINE) ---\nCould not reach Qdrant Vector Store: {e}"
     
-    # Only fetch history for complex analysis
     if 'month' in query.lower() or 'compare' in query.lower() or 'buy' in query.lower() or 'better' in query.lower():
         history_str = fetch_historical_metrics(detected_tickers)
         context_str += f"\n\n--- HISTORICAL ARCHIVE ---\n{history_str}"
@@ -67,7 +66,6 @@ def get_adaptive_context(query: str) -> str:
     return context_str
 
 def query_adaptive_agent(query: str, context: str):
-    # Intent Detection: Factual vs. Analytical
     factual_triggers = ['price', 'what is', 'how much', 'current value']
     strategic_triggers = [
         'buy', 'compare', 'better', 'should', 'analyze', 'trend', 
@@ -77,7 +75,6 @@ def query_adaptive_agent(query: str, context: str):
     is_strategic = any(k in query.lower() for k in strategic_triggers)
     
     if not is_strategic:
-        # FLASH MODE: High-speed factual lookup
         prompt = f"""<|system|>
 You are a High-Speed Market Data Terminal. Provide a CONCISE, ONE-LINE data response. 
 Include the current price and a brief momentum indicator (e.g., 'Trending Up').
@@ -89,7 +86,6 @@ Question: {query}
 <|assistant|>
 Answer:"""
     else:
-        # STRATEGIC MODE: Narrative-aware analysis
         prompt = f"""<|system|>
 You are a Senior Market Intelligence Agent. Provide a structured Strategic Analysis.
 MANDATORY REPORT STRUCTURE:
@@ -105,25 +101,32 @@ Question: {query}
 <|assistant|>
 Answer:"""
 
-    response = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"num_ctx": 4096, "temperature": 0}}
-    )
-    return response.json().get('response', 'Error')
+    try:
+        response = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"num_ctx": 4096, "temperature": 0}},
+            timeout=120
+        )
+        response_json = response.json()
+        if 'error' in response_json:
+            return f"⚠️ **Ollama Error:** {response_json['error']}"
+        return response_json.get('response', 'Error')
+    except requests.exceptions.RequestException as e:
+        return f"⚠️ **Intelligence Core Offline:** Could not connect to Ollama at {OLLAMA_URL}. Ensure Ollama is running and the Llama 3.2 model is pulled.\n\nError details: {e}"
+
+def process_query(query: str):
+    """Entry point for the Web Frontend — do NOT remove."""
+    context = get_adaptive_context(query)
+    answer = query_adaptive_agent(query, context)
+    return {"answer": answer, "is_strategic": len(answer) > 150}
 
 def main():
     print(f"🚀 [ADAPTIVE INTELLIGENCE CORE] Intent-Aware Mode Active.")
     while True:
         query = input("\nQuery Market Intelligence: ")
         if query.lower() in ['exit', 'quit']: break
-        
-        context = get_adaptive_context(query)
-        answer = query_adaptive_agent(query, context)
-        
-        print(f"\n✨ Response:")
-        print("=" * 75 if len(answer) > 100 else "-" * 20)
-        print(answer)
-        print("=" * 75 if len(answer) > 100 else "-" * 20)
+        res = process_query(query)
+        print(f"\n✨ Response:\n{'='*75 if res['is_strategic'] else '-'*20}\n{res['answer']}")
 
 if __name__ == "__main__":
     main()

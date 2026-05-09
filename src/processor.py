@@ -15,7 +15,6 @@ from datetime import datetime
 
 load_dotenv()
 
-# Configuration
 KAFKA_CONF = {
     'bootstrap.servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092'),
     'group.id': 'rag-multimodal-processor',
@@ -27,7 +26,6 @@ QDRANT_PORT = 6333
 COLLECTION_NAME = os.getenv('QDRANT_COLLECTION', 'real_time_knowledge')
 DASHBOARD_URL = "http://127.0.0.1:8000/update_metrics"
 
-# Initialize
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, check_compatibility=False)
 embedder = SentenceTransformer('all-MiniLM-L6-v2')
 analyzer = SentimentIntensityAnalyzer()
@@ -60,7 +58,6 @@ def analysis_node(state: ProcessorState):
 
 def embed_node(state: ProcessorState):
     start_time = time.time()
-    # Prepend sentiment to content for semantic search awareness
     text_to_embed = f"[{state['semantic_data']['sentiment']}] {state['semantic_data']['content']}"
     state['embedding'] = embedder.encode(text_to_embed).tolist()
     state['latencies'] = {"embed_ms": (time.time() - start_time) * 1000}
@@ -98,7 +95,6 @@ def index_node(state: ProcessorState):
     except: pass
     return state
 
-# Build Graph
 workflow = StateGraph(ProcessorState)
 workflow.add_node("analyze", analysis_node)
 workflow.add_node("embed", embed_node)

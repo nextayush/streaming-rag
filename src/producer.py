@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Kafka configuration
 conf = {
     'bootstrap.servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', '127.0.0.1:9092'),
     'client.id': 'advanced-aliasing-producer'
@@ -18,7 +17,6 @@ conf = {
 producer = Producer(conf)
 topic = os.getenv('KAFKA_TOPIC', 'live_stream')
 
-# Expanded Stock Universe with Human-Readable Names
 STOCK_MAP = {
     'AAPL': 'Apple Inc.',
     'MSFT': 'Microsoft Corporation',
@@ -53,7 +51,6 @@ def fetch_enhanced_data(symbol, company_name):
         
         messages = []
         
-        # 1. Price Message with Explicit Company Name for Semantic Search
         messages.append({
             "type": "PRICE_UPDATE",
             "timestamp": datetime.now().isoformat(),
@@ -64,7 +61,6 @@ def fetch_enhanced_data(symbol, company_name):
             "metadata": {"price": current_price, "source": "YahooFinance"}
         })
         
-        # 2. News Message with Explicit Company Name
         news = ticker.news or []
         for article in news[:2]:
             title = article.get('title')
